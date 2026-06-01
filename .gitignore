@@ -144,3 +144,4 @@ apps/desktop/demo/
 agentdb.rvf
 agentdb.rvf.lock
 ruvector.db
+.worktrees/
