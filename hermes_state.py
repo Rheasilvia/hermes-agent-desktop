@@ -1208,6 +1208,12 @@ class SessionDB:
                     )
                 except sqlite3.OperationalError:
                     pass
+            if current_version < 15:
+                # v15: session IDs are the identity; titles are labels and may
+                # repeat across independent sessions. Older DBs created a
+                # unique title index, which made auto-title fail when two
+                # conversations naturally generated the same title.
+                cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
             if current_version < 16:
                 # v16: tag delegate subagent rows so pickers stay clean after
                 # parent deletes that used to orphan them (parent_session_id → NULL).
@@ -1240,14 +1246,11 @@ class SessionDB:
                     (SCHEMA_VERSION,),
                 )
 
-        # Unique title index — always ensure it exists
-        try:
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                "ON sessions(title) WHERE title IS NOT NULL"
-            )
-        except sqlite3.OperationalError:
-            pass  # Index already exists
+        cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_title "
+            "ON sessions(title) WHERE title IS NOT NULL"
+        )
 
         if fts5_available:
             # FTS5 setup. Run the DDL even when the virtual table exists so
@@ -1777,23 +1780,13 @@ class SessionDB:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
+        Raises ValueError if the title fails validation (too long, invalid
+        characters). Titles are labels, not identities, and may repeat across
+        sessions; updates are scoped by session ID.
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
         def _do(conn):
-            if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
-                if conflict:
-                    raise ValueError(
-                        f"Title '{title}' is already in use by session {conflict['id']}"
-                    )
             cursor = conn.execute(
                 "UPDATE sessions SET title = ? WHERE id = ?",
                 (title, session_id),
@@ -1864,10 +1857,13 @@ class SessionDB:
         return rowcount > 0
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+        """Look up the most recent session with an exact title."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                "SELECT * FROM sessions WHERE title = ? "
+                "ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, id DESC "
+                "LIMIT 1",
+                (title,),
             )
             row = cursor.fetchone()
         return dict(row) if row else None
