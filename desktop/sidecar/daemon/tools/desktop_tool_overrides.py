@@ -24,6 +24,9 @@ _execute_code_popen_lock = _threading.Lock()
 # tool's restore from clobbering another's. Single-session desktop use keeps it
 # uncontested (file I/O serializes behind it — an accepted tradeoff).
 _local_subprocess_lock = _threading.Lock()
+# Serializes temporary process-wide environment and tempfile cache mutations used
+# to steer sandboxed children away from user home and world-writable temp dirs.
+_sandbox_process_state_lock = _threading.RLock()
 
 # Process ownership registry: proc_id -> {workspace_hash, session_id}.
 # Entries accumulate and are never evicted — acceptable for single-session desktop use.
@@ -31,33 +34,53 @@ _local_subprocess_lock = _threading.Lock()
 _desktop_process_registry: dict[str, dict] = {}
 _desktop_process_registry_lock = _threading.Lock()
 _TEMP_ENV_KEYS = ("TMPDIR", "TMP", "TEMP", "HERMES_EXECUTE_CODE_SOCKET_DIR")
+_SCRATCH_ENV_KEYS = (
+    *_TEMP_ENV_KEYS,
+    "HOME",
+    "GIT_CONFIG_GLOBAL",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+)
+
+
+def _workspace_sandbox_scratch(snapshot: Any) -> Any:
+    from ..services.sandbox_runner import ensure_workspace_sandbox_scratch
+
+    return ensure_workspace_sandbox_scratch(snapshot.workspace_root)
+
+
+@_contextmanager
+def _workspace_sandbox_temp_env(snapshot: Any, *tempfile_modules: Any):
+    with _sandbox_process_state_lock:
+        scratch = _workspace_sandbox_scratch(snapshot)
+        scratch_str = str(scratch)
+        previous_env = {key: _os.environ.get(key) for key in _SCRATCH_ENV_KEYS}
+        previous_tempdirs = [(module, getattr(module, "tempdir", None)) for module in tempfile_modules]
+
+        try:
+            for key in _TEMP_ENV_KEYS:
+                _os.environ[key] = scratch_str
+            _os.environ["HOME"] = scratch_str
+            _os.environ["GIT_CONFIG_GLOBAL"] = str(scratch / "gitconfig")
+            _os.environ["XDG_CONFIG_HOME"] = str(scratch / "xdg-config")
+            _os.environ["XDG_CACHE_HOME"] = str(scratch / "xdg-cache")
+            for module, _previous in previous_tempdirs:
+                module.tempdir = None
+            yield scratch
+        finally:
+            for key, value in previous_env.items():
+                if value is None:
+                    _os.environ.pop(key, None)
+                else:
+                    _os.environ[key] = value
+            for module, previous in previous_tempdirs:
+                module.tempdir = previous
 
 
 @_contextmanager
 def _workspace_execute_code_temp_env(snapshot: Any, code_execution_tool_module: Any):
-    scratch = _PathUtil(snapshot.workspace_root) / ".hermes-sandbox"
-    scratch.mkdir(parents=True, exist_ok=True)
-    try:
-        scratch.chmod(0o700)
-    except OSError:
-        pass
-
-    scratch_str = str(scratch)
-    previous_env = {key: _os.environ.get(key) for key in _TEMP_ENV_KEYS}
-    previous_tempdir = code_execution_tool_module.tempfile.tempdir
-
-    try:
-        for key in _TEMP_ENV_KEYS:
-            _os.environ[key] = scratch_str
-        code_execution_tool_module.tempfile.tempdir = None
+    with _workspace_sandbox_temp_env(snapshot, code_execution_tool_module.tempfile) as scratch:
         yield scratch
-    finally:
-        for key, value in previous_env.items():
-            if value is None:
-                _os.environ.pop(key, None)
-            else:
-                _os.environ[key] = value
-        code_execution_tool_module.tempfile.tempdir = previous_tempdir
 
 
 def _import_required_tool_modules() -> None:
@@ -160,8 +183,10 @@ def _run_file_tool_sandboxed(
         from ..services.sandbox_runner import get_sandbox_runner
         runner = get_sandbox_runner()
         if runner is not None:
-            with _sandboxed_local_subprocess(snapshot, runner):
-                return original_entry.handler(call_args, **handler_kwargs)
+            import tools.environments.local as _local_env
+            with _workspace_sandbox_temp_env(snapshot, _local_env.tempfile):
+                with _sandboxed_local_subprocess(snapshot, runner):
+                    return original_entry.handler(call_args, **handler_kwargs)
     return original_entry.handler(call_args, **handler_kwargs)
 
 
@@ -378,6 +403,15 @@ def _install_wrappers(registry) -> None:
             "code": "PLAN_MODE_RESTRICTED",
         }, ensure_ascii=False)
 
+    def _is_read_only_sandbox(snapshot: Any) -> bool:
+        return getattr(snapshot, "sandbox_mode", "workspace-write") == "read-only"
+
+    def _read_only_denied(tool_name: str) -> str:
+        return json.dumps({
+            "error": f"{tool_name} denied: desktop sandbox is read-only",
+            "code": "SANDBOX_READ_ONLY",
+        }, ensure_ascii=False)
+
     # Boundary note: file tools (read_file/write_file/patch/search_files) are
     # confined FIRST by workspace_policy.resolve_path — the Python path boundary
     # (L1), which canonicalizes (incl. final-component symlinks) and enforces
@@ -428,6 +462,8 @@ def _install_wrappers(registry) -> None:
                 return _fail_closed(name, args)
             if _is_plan_mode(snapshot):
                 return _plan_mode_denied(name)
+            if _is_read_only_sandbox(snapshot):
+                return _read_only_denied(name)
             path = args.get("path", "") if isinstance(args, dict) else ""
             decision = resolve_path(snapshot, str(path), "write")
             # Outside-workspace denials are final — never route to approval flow.
@@ -453,6 +489,8 @@ def _install_wrappers(registry) -> None:
                 return _fail_closed("patch", args)
             if _is_plan_mode(snapshot):
                 return _plan_mode_denied("patch")
+            if _is_read_only_sandbox(snapshot):
+                return _read_only_denied("patch")
 
             if isinstance(args, dict) and "path" in args:
                 # Replace mode: single file write
@@ -516,6 +554,85 @@ def _install_wrappers(registry) -> None:
     # -----------------------------------------------------------------------
     # terminal: workdir enforcement + best-effort command path scan
     # -----------------------------------------------------------------------
+
+    def _dangerous_command_gate(command: str, session_id: str) -> str:
+        """Enforce ``security.dangerous_commands`` for the terminal tool.
+
+        If the command matches any user-configured dangerous pattern (or the
+        built-in defaults when the key is absent), route it through the human
+        approval flow when approvals are enabled.
+        Returns ``"allow"`` (approved or non-dangerous) or ``"deny"``.
+
+        This closes a dead-config gap: the Security tab already let users list
+        dangerous command fragments, but the sidecar never read them, so the
+        protection was silently absent.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            hermes_home = get_hermes_home()
+        except Exception:
+            hermes_home = str(_PathUtil.home() / ".hermes")
+
+        try:
+            from ..services.command_safety import (
+                DEFAULT_DANGEROUS_PATTERNS,
+                command_matches_patterns,
+            )
+        except Exception:
+            log.exception("[desktop] dangerous-command gate: matcher unavailable; requiring approval")
+            sec = {"dangerous_commands": None, "approval_required": True}
+            patterns = []
+            matched = True
+        else:
+            try:
+                from ..readers.hermes_config import read_security_config
+                sec = read_security_config(hermes_home)
+            except Exception:
+                log.exception("[desktop] dangerous-command gate: config read failed; using safe defaults")
+                sec = {"dangerous_commands": None, "approval_required": True}
+            patterns = sec.get("dangerous_commands")
+            if patterns is None:
+                patterns = list(DEFAULT_DANGEROUS_PATTERNS)
+            matched = command_matches_patterns(str(command), patterns)
+
+        if not sec.get("approval_required", True):
+            return "allow"
+
+        if not matched:
+            return "allow"
+
+        try:
+            import tools.path_approval as _pa
+            if _pa.get_permission_mode() == "full":
+                return "allow"
+        except Exception:
+            log.exception("[desktop] dangerous-command gate: permission mode check failed; requiring approval")
+
+        try:
+            import tools.approval as _approval
+            approval_mode = _approval._get_approval_mode()  # type: ignore[attr-defined]
+            if (
+                getattr(_approval, "_YOLO_MODE_FROZEN", False)
+                or _approval.is_session_yolo_enabled(session_id)
+                or _approval.is_current_session_yolo_enabled()
+                or approval_mode == "off"
+            ):
+                return "allow"
+        except Exception:
+            log.exception("[desktop] dangerous-command gate: approval bypass check failed; requiring approval")
+
+        import tools.path_approval as _pa
+
+        decision = _pa.request_path_approval(
+            path="",
+            operation=f"terminal:dangerous",
+            session_id=session_id,
+            session_key=f"terminal:{command}",
+        )
+
+        if decision == "deny":
+            return "deny"
+        return "allow"
 
     def _make_terminal_wrapper():
         import re
@@ -606,6 +723,18 @@ def _install_wrappers(registry) -> None:
                     except Exception:
                         pass  # don't block on parse errors
 
+            # 3.5. Dangerous-command approval gate (security.dangerous_commands).
+            # Must run BEFORE dispatch so it covers both local (seatbelt) and
+            # non-local backends. Full/YOLO/approvals.mode=off skip the prompt
+            # but do not skip the sandboxed subprocess path below.
+            if command:
+                gate = _dangerous_command_gate(str(command), str(snapshot.session_id))
+                if gate == "deny":
+                    return json.dumps({
+                        "error": "terminal denied by user (dangerous command approval)",
+                        "code": "DENIED",
+                    })
+
             # 4. Pass through with canonical workdir. For local desktop terminal,
             # command parsing is only an early rejection layer; the subprocess
             # itself must be created through macOS seatbelt.
@@ -639,8 +768,10 @@ def _install_wrappers(registry) -> None:
                     "code": "SANDBOX_UNAVAILABLE",
                 })
 
-            with _sandboxed_local_subprocess(snapshot, runner):
-                result_str = original_entry.handler(new_args, **kwargs)
+            import tools.environments.local as _local_env
+            with _workspace_sandbox_temp_env(snapshot, _local_env.tempfile):
+                with _sandboxed_local_subprocess(snapshot, runner):
+                    result_str = original_entry.handler(new_args, **kwargs)
 
             if bool(new_args.get("background")):
                 _register_process_owner(snapshot, result_str)
