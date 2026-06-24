@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from daemon.app import build_app
 from daemon.config import Config
-from daemon.routers.events import event_stream
+from daemon.routers.events import _replay_pending_user_inputs, event_stream
 from daemon.services import session_service
 
 
@@ -47,6 +47,7 @@ class TestSessionCRUD:
         assert data["session_id"].startswith("desktop_")
         assert data["permissionMode"] == "auto"
         assert data["runtime"]["reasoningEffort"] == "medium"
+        assert data["runtime"]["collaborationMode"] == "default"
 
     def test_create_session_without_workspace_creates_default_workspace(
         self, client, monkeypatch, tmp_path
@@ -343,15 +344,28 @@ class TestSessionCRUD:
         data = resp.json()
         assert data == {
             "id": sid,
-            "runtime": {"reasoningEffort": "high"},
+            "runtime": {"reasoningEffort": "high", "collaborationMode": "default"},
             "appliedToActiveTurn": True,
             "appliesNextTurn": False,
         }
         assert client.get(f"/desktop/api/sessions/{sid}").json()["runtime"] == {
-            "reasoningEffort": "high"
+            "reasoningEffort": "high",
+            "collaborationMode": "default",
         }
         assert client.get("/desktop/api/sessions").json()[0]["runtime"] == {
-            "reasoningEffort": "high"
+            "reasoningEffort": "high",
+            "collaborationMode": "default",
+        }
+
+        plan_resp = client.patch(
+            f"/desktop/api/sessions/{sid}/runtime",
+            json={"collaborationMode": "plan"},
+        )
+
+        assert plan_resp.status_code == 200
+        assert plan_resp.json()["runtime"] == {
+            "reasoningEffort": "high",
+            "collaborationMode": "plan",
         }
 
     def test_session_runtime_patch_rejects_empty_and_invalid_values(self, client):
@@ -367,7 +381,8 @@ class TestSessionCRUD:
         assert empty.status_code == 422
         assert invalid.status_code == 422
         assert client.get(f"/desktop/api/sessions/{sid}").json()["runtime"] == {
-            "reasoningEffort": "medium"
+            "reasoningEffort": "medium",
+            "collaborationMode": "default",
         }
 
     def test_session_runtime_patch_returns_404_for_unknown_session(self, client):
@@ -384,13 +399,16 @@ class TestSessionCRUD:
         sid = created.json()["id"]
         client.patch(
             f"/desktop/api/sessions/{sid}/runtime",
-            json={"reasoningEffort": "xhigh"},
+            json={"reasoningEffort": "xhigh", "collaborationMode": "plan"},
         )
 
         branched = client.post(f"/desktop/api/sessions/{sid}/branch")
 
         assert branched.status_code == 200
-        assert branched.json()["runtime"] == {"reasoningEffort": "xhigh"}
+        assert branched.json()["runtime"] == {
+            "reasoningEffort": "xhigh",
+            "collaborationMode": "plan",
+        }
 
     def test_session_runtime_patch_does_not_mutate_running_agent(self, client):
         created = client.post("/desktop/api/sessions", json={})
@@ -924,6 +942,91 @@ def test_startup_reset_clears_only_desktop_conversation_data(tmp_path):
 
     assert list_messages(home, "desktop_old") == []
     assert list_turns(home, "desktop_old") == []
+
+
+def test_user_input_respond_is_idempotent_and_triggers_recovery(client):
+    from daemon.db.ui_messages import append
+    from daemon.db.user_input_prompts import create_request, get_request
+
+    home = client.app.state.cfg.hermes_home
+    sid = "sess-user-input-endpoint"
+    turn_id = "turn-user-input-endpoint"
+    append(home, sid, "user", {"text": "plan this"}, turn_id=turn_id)
+    create_request(
+        home,
+        session_id=sid,
+        turn_id=turn_id,
+        request_id="req-endpoint",
+        questions=[
+            {
+                "id": "scope",
+                "header": "Scope",
+                "question": "Which scope?",
+                "options": [{"label": "Broad", "description": "Include recovery."}],
+            }
+        ],
+    )
+
+    class _FakeExec:
+        def __init__(self):
+            self.calls = []
+
+        def resume_user_input_turn(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    fake_exec = _FakeExec()
+    client.app.state.agent_exec_svc = fake_exec
+
+    body = {
+        "session_id": sid,
+        "request_id": "req-endpoint",
+        "answers": {"scope": {"answers": ["Broad"]}},
+    }
+    first = client.post("/desktop/api/user-input/respond", json=body)
+    second = client.post("/desktop/api/user-input/respond", json=body)
+
+    assert first.status_code == 200
+    assert first.json()["resumed"] == "recovery"
+    assert second.status_code == 200
+    assert len(fake_exec.calls) == 1
+    assert fake_exec.calls[0]["turn_id"] == turn_id
+    assert get_request(home, "req-endpoint")["status"] == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_sse_replays_only_pending_user_input_requests(client, monkeypatch):
+    from daemon.db.ui_messages import append
+    from daemon.db.user_input_prompts import create_request
+
+    home = client.app.state.cfg.hermes_home
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    sid = "sess-user-input-replay"
+    turn_id = "turn-user-input-replay"
+    append(home, sid, "user", {"text": "plan this"}, turn_id=turn_id)
+    create_request(
+        home,
+        session_id=sid,
+        turn_id=turn_id,
+        request_id="req-replay",
+        questions=[{"id": "scope", "header": "Scope", "question": "Which scope?", "options": []}],
+    )
+
+    pending_events = [event async for event in _replay_pending_user_inputs()]
+    assert pending_events
+    assert '"type": "user_input.request"' in pending_events[0]
+
+    client.app.state.agent_exec_svc = MagicMock()
+    client.post(
+        "/desktop/api/user-input/respond",
+        json={
+            "session_id": sid,
+            "request_id": "req-replay",
+            "answers": {"scope": {"answers": ["Broad"]}},
+        },
+    )
+    answered_events = [event async for event in _replay_pending_user_inputs()]
+    assert answered_events == []
 
 
 class TestSSEEventStream:

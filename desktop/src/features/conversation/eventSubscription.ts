@@ -1,9 +1,11 @@
 import { onMount, onCleanup } from 'solid-js';
 import type {
   MessageDeltaPayload, MessageCompletePayload, ReasoningDeltaPayload,
+  PlanDeltaPayload, PlanCompletePayload,
   ToolStartPayload, ToolProgressPayload, ToolCompletePayload,
   ToolGeneratingPayload, ToolErrorPayload,
   ApprovalRequestPayload, ClarifyRequestPayload,
+  UserInputRequestPayload, UserInputResponsePayload,
   SudoRequestPayload, SecretRequestPayload,
   BackgroundCompletePayload, BtwCompletePayload,
   SubagentStartPayload, SubagentProgressPayload,
@@ -42,6 +44,8 @@ export function useGatewayEvents(opts: {
   // session from the component. This ensures events are routed to the correct
   // session even when the user has multiple sessions open or switches between them.
   const onMessageDelta = (p: MessageDeltaPayload) => chatStore.handleDelta(p.session_id, p);
+  const onPlanDelta = (p: PlanDeltaPayload) => chatStore.handlePlanDelta(p.session_id, p);
+  const onPlanComplete = (p: PlanCompletePayload) => chatStore.handlePlanComplete(p.session_id, p);
   const onMessageComplete = (p: MessageCompletePayload) => {
     chatStore.handleMessageComplete(p.session_id, p);
     nativeNotifications.turnDone(p.session_id);
@@ -59,6 +63,8 @@ export function useGatewayEvents(opts: {
   const onSudoRequest = (p: SudoRequestPayload) => chatStore.handleSudoRequest(p.session_id, p);
   const onSecretRequest = (p: SecretRequestPayload) => chatStore.handleSecretRequest(p.session_id, p);
   const onClarifyRequest = (p: ClarifyRequestPayload) => chatStore.handleClarifyRequest(p.session_id, p);
+  const onUserInputRequest = (p: UserInputRequestPayload) => chatStore.handleUserInputRequest(p.session_id, p);
+  const onUserInputResponse = (p: UserInputResponsePayload) => chatStore.handleUserInputResponse(p.session_id, p);
   const onBackgroundComplete = (p: BackgroundCompletePayload) => {
     backgroundTaskStore.handleComplete(p);
     nativeNotifications.backgroundDone(undefined, 'Background task complete');
@@ -88,6 +94,8 @@ export function useGatewayEvents(opts: {
     const gw = opts.getGateway();
     if (!gw) return;
     gw.on('message.delta', onMessageDelta);
+    gw.on('plan.delta', onPlanDelta);
+    gw.on('plan.complete', onPlanComplete);
     gw.on('message.complete', onMessageComplete);
     gw.on('reasoning.delta', onReasoningDelta);
     gw.on('tool.start', onToolStart);
@@ -99,6 +107,8 @@ export function useGatewayEvents(opts: {
     gw.on('sudo.request', onSudoRequest);
     gw.on('secret.request', onSecretRequest);
     gw.on('clarify.request', onClarifyRequest);
+    gw.on('user_input.request', onUserInputRequest);
+    gw.on('user_input.response', onUserInputResponse);
     gw.on('background.complete', onBackgroundComplete);
     gw.on('btw.complete', onBtwComplete);
     gw.on('subagent.start', onSubagentStart);
@@ -114,6 +124,8 @@ export function useGatewayEvents(opts: {
     const gw = opts.getGateway();
     if (!gw) return;
     gw.off('message.delta', onMessageDelta);
+    gw.off('plan.delta', onPlanDelta);
+    gw.off('plan.complete', onPlanComplete);
     gw.off('message.complete', onMessageComplete);
     gw.off('reasoning.delta', onReasoningDelta);
     gw.off('tool.start', onToolStart);
@@ -125,6 +137,8 @@ export function useGatewayEvents(opts: {
     gw.off('sudo.request', onSudoRequest);
     gw.off('secret.request', onSecretRequest);
     gw.off('clarify.request', onClarifyRequest);
+    gw.off('user_input.request', onUserInputRequest);
+    gw.off('user_input.response', onUserInputResponse);
     gw.off('background.complete', onBackgroundComplete);
     gw.off('btw.complete', onBtwComplete);
     gw.off('subagent.start', onSubagentStart);

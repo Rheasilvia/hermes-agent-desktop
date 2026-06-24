@@ -46,6 +46,7 @@ class SetPermissionModeRequest(BaseModel):
 
 class UpdateSessionRuntimeRequest(BaseModel):
     reasoningEffort: Optional[str] = None
+    collaborationMode: Optional[str] = None
 
 
 class PromptExecuteRequest(BaseModel):
@@ -78,6 +79,12 @@ class ClarifyRespondRequest(BaseModel):
     session_id: str
     request_id: str
     answer: str
+
+
+class UserInputRespondRequest(BaseModel):
+    session_id: str
+    request_id: str
+    answers: dict
 
 
 class SudoRespondRequest(BaseModel):

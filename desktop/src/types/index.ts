@@ -59,6 +59,7 @@ export type { DbMessage } from './db/message.js';
 export type {
   SessionMeta,
   DesktopPermissionMode,
+  CollaborationMode,
   ReasoningEffort,
   SessionRuntime,
   SessionRuntimeUpdateResult,
@@ -81,6 +82,7 @@ export type { ConversationMessage, ParsedToolCall, MessageAttachment } from './d
 // UI rendering types
 export type {
   MessageBlock, TextBlock, CodeBlock, ReasoningBlock,
+  PlanBlock,
   ToolCallBlock, RichContentBlock, RichContentKind, AttachmentBlock,
   TodoListBlock,
 } from './ui/blocks.js';
@@ -89,5 +91,5 @@ export type {
   ImageContent, ImageTextContent, FileContent,
 } from './ui/rich.js';
 export type { RenderedMessage, MessageAction, MessageActionType } from './ui/message.js';
-export type { TurnStatus, LiveTurnState, LiveToolCall, PendingPermission, PendingClarify, MemoryContextItem } from './ui/turn.js';
+export type { TurnStatus, LiveTurnState, LiveToolCall, PendingPermission, PendingClarify, PendingUserInput, MemoryContextItem } from './ui/turn.js';
 export type { ToolCallRow } from './ui/tool-presentation.js';

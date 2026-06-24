@@ -10,6 +10,8 @@ import { produce } from 'solid-js/store';
 import type {
   MessageDeltaPayload,
   MessageCompletePayload,
+  PlanDeltaPayload,
+  PlanCompletePayload,
   ReasoningDeltaPayload,
   ToolStartPayload,
   ToolProgressPayload,
@@ -18,6 +20,9 @@ import type {
   ToolErrorPayload,
   ApprovalRequestPayload,
   ClarifyRequestPayload,
+  UserInputAnswersPayload,
+  UserInputRequestPayload,
+  UserInputResponsePayload,
   SudoRequestPayload,
   SecretRequestPayload,
   ErrorPayload,
@@ -55,6 +60,8 @@ import {
   latestMatchingToolIndex,
   appendActivityText,
   appendActivityReasoning,
+  appendActivityPlan,
+  completeActivityPlan,
   syncActivityToolBlock,
   syncActivityTodoBlock,
   finalizeActivityBlocks,
@@ -134,7 +141,7 @@ export const chatStore = {
 
   isStreaming(sessionId: string): boolean {
     const status = chatStates[sessionId]?.liveState.status;
-    return status === 'submitting' || status === 'accepted' || status === 'streaming' || status === 'tool_running' || status === 'stalled';
+    return status === 'submitting' || status === 'accepted' || status === 'streaming' || status === 'tool_running' || status === 'awaiting_user' || status === 'stalled';
   },
 
   getError(sessionId: string): string | null {
@@ -317,6 +324,22 @@ export const chatStore = {
     noteLiveEvent(sessionId);
     setChatStates(sessionId, 'liveState', 'reasoningText', (t) => t + payload.text);
     appendActivityReasoning(sessionId, payload.text);
+  },
+
+  handlePlanDelta(sessionId: string, payload: PlanDeltaPayload): void {
+    if (dropIfInterrupted(sessionId)) return;
+    if (!noteTurnEvent(sessionId, payload)) return;
+    noteLiveEvent(sessionId);
+    appendActivityPlan(sessionId, payload.text);
+    setChatStates(sessionId, 'liveState', 'status', 'streaming');
+  },
+
+  handlePlanComplete(sessionId: string, payload: PlanCompletePayload): void {
+    if (dropIfInterrupted(sessionId)) return;
+    if (!noteTurnEvent(sessionId, payload)) return;
+    noteLiveEvent(sessionId);
+    completeActivityPlan(sessionId);
+    setChatStates(sessionId, 'liveState', 'status', 'streaming');
   },
 
   handleToolStart(sessionId: string, payload: ToolStartPayload): void {
@@ -610,6 +633,7 @@ export const chatStore = {
       state.liveState.status === 'accepted' ||
       state.liveState.status === 'streaming' ||
       state.liveState.status === 'tool_running' ||
+      state.liveState.status === 'awaiting_user' ||
       state.liveState.status === 'stalled'
     );
     if (cancellable) {
@@ -697,6 +721,35 @@ export const chatStore = {
     });
   },
 
+  handleUserInputRequest(sessionId: string, payload: UserInputRequestPayload): void {
+    ensureSession(sessionId);
+    clearStalledTimer(sessionId);
+    setChatStates(sessionId, produce((s) => {
+      s.liveState.status = 'awaiting_user';
+      s.liveState.turnId = payload.turn_id ?? s.liveState.turnId;
+      s.liveState.lastEventSeq = payload.event_seq ?? s.liveState.lastEventSeq;
+      s.liveState.pendingUserInput = {
+        requestId: payload.request_id,
+        turnId: payload.turn_id ?? null,
+        questions: payload.questions ?? [],
+      };
+      s.liveState.pendingClarify = null;
+    }));
+  },
+
+  handleUserInputResponse(sessionId: string, payload: UserInputResponsePayload): void {
+    ensureSession(sessionId);
+    setChatStates(sessionId, produce((s) => {
+      if (s.liveState.pendingUserInput?.requestId === payload.request_id) {
+        s.liveState.pendingUserInput = null;
+      }
+      s.liveState.status = 'accepted';
+      s.liveState.turnId = payload.turn_id ?? s.liveState.turnId;
+      s.liveState.lastEventSeq = payload.event_seq ?? s.liveState.lastEventSeq;
+    }));
+    noteLiveEvent(sessionId);
+  },
+
   async respondApproval(sessionId: string, choice: boolean | string): Promise<void> {
     const pending = chatStates[sessionId]?.liveState.pendingPermission;
     setChatStates(sessionId, 'liveState', 'pendingPermission', null);
@@ -727,6 +780,30 @@ export const chatStore = {
     setChatStates(sessionId, 'liveState', 'pendingClarify', null);
     const gw = getGateway();
     if (gw) await gw.clarify.respond({ session_id: sessionId, request_id: requestId, answer: text }).catch(() => {});
+  },
+
+  async respondUserInput(sessionId: string, requestId: string, answers: UserInputAnswersPayload): Promise<void> {
+    const pending = chatStates[sessionId]?.liveState.pendingUserInput ?? null;
+    setChatStates(sessionId, produce((s) => {
+      if (s.liveState.pendingUserInput?.requestId === requestId) {
+        s.liveState.pendingUserInput = null;
+      }
+      s.liveState.status = 'accepted';
+    }));
+    noteLiveEvent(sessionId);
+    const gw = getGateway();
+    if (!gw) return;
+    try {
+      await gw.userInput.respond({ session_id: sessionId, request_id: requestId, answers });
+    } catch {
+      if (pending) {
+        clearStalledTimer(sessionId);
+        setChatStates(sessionId, produce((s) => {
+          s.liveState.status = 'awaiting_user';
+          s.liveState.pendingUserInput = pending;
+        }));
+      }
+    }
   },
 
   setMemoryContext(sessionId: string, items: MemoryContextItem[] | null): void {

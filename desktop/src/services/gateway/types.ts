@@ -41,6 +41,8 @@ import type {
   PromptExecuteResult,
   MessageDeltaPayload,
   MessageCompletePayload,
+  PlanDeltaPayload,
+  PlanCompletePayload,
   MessageStatusPayload,
   ThinkingDeltaPayload,
   ReasoningDeltaPayload,
@@ -53,6 +55,9 @@ import type {
   ToolErrorPayload,
   ApprovalRequestPayload,
   ClarifyRequestPayload,
+  UserInputAnswersPayload,
+  UserInputRequestPayload,
+  UserInputResponsePayload,
   SudoRequestPayload,
   SecretRequestPayload,
   BackgroundCompletePayload,
@@ -80,6 +85,8 @@ export interface GatewayEventMap {
   'message.start': MessageStartPayload;
   'message.delta': MessageDeltaPayload;
   'message.complete': MessageCompletePayload;
+  'plan.delta': PlanDeltaPayload;
+  'plan.complete': PlanCompletePayload;
   'thinking.delta': ThinkingDeltaPayload;
   'reasoning.delta': ReasoningDeltaPayload;
   'reasoning.available': ReasoningAvailablePayload;
@@ -91,6 +98,8 @@ export interface GatewayEventMap {
   'tool.error': ToolErrorPayload;
   'approval.request': ApprovalRequestPayload;
   'clarify.request': ClarifyRequestPayload;
+  'user_input.request': UserInputRequestPayload;
+  'user_input.response': UserInputResponsePayload;
   'sudo.request': SudoRequestPayload;
   'secret.request': SecretRequestPayload;
   'background.complete': BackgroundCompletePayload;
@@ -235,6 +244,11 @@ export interface ApprovalMethods {
 /** Clarify method group. */
 export interface ClarifyMethods {
   respond(params: { session_id: string; request_id: string; answer: string }): Promise<void>;
+}
+
+/** request_user_input method group. */
+export interface UserInputMethods {
+  respond(params: { session_id: string; request_id: string; answers: UserInputAnswersPayload }): Promise<void>;
 }
 
 /** Sudo method group. */
@@ -403,6 +417,7 @@ export interface GatewayAdapter extends GatewayEventEmitter {
   readonly provider: ProviderMethods;
   readonly approval: ApprovalMethods;
   readonly clarify: ClarifyMethods;
+  readonly userInput: UserInputMethods;
   readonly sudo: SudoMethods;
   readonly secret: SecretMethods;
   readonly cron: CronMethods;
@@ -426,7 +441,7 @@ export interface GatewayAdapter extends GatewayEventEmitter {
   getConnectionState(): ConnectionState;
 }
 
-export type { DesktopPermissionMode, ReasoningEffort, SessionRuntime, SessionRuntimeUpdateResult, SessionListItem, SessionMessage, SessionMeta, SessionTranscript, SessionInfoPayload, HermesConfig, ToolEntry, WorkspaceChildrenResult, WorkspaceFileResult, GitDiffResult, ModelOption, CronJob, CreateCronJobParams, UpdateCronJobParams, McpServer, McpTool, MemoryFile, MemoryFileWithContent, MemoryProject, MemorySearchHit, MemoryScope, WellKnownMemoryName, ContextFile, MemoryEntry, SessionUsagePayload, PromptExecuteResult } from '@/types/index.js';
+export type { CollaborationMode, DesktopPermissionMode, ReasoningEffort, SessionRuntime, SessionRuntimeUpdateResult, SessionListItem, SessionMessage, SessionMeta, SessionTranscript, SessionInfoPayload, HermesConfig, ToolEntry, WorkspaceChildrenResult, WorkspaceFileResult, GitDiffResult, ModelOption, CronJob, CreateCronJobParams, UpdateCronJobParams, McpServer, McpTool, MemoryFile, MemoryFileWithContent, MemoryProject, MemorySearchHit, MemoryScope, WellKnownMemoryName, ContextFile, MemoryEntry, SessionUsagePayload, PromptExecuteResult, UserInputAnswersPayload } from '@/types/index.js';
 
 /** Factory options for creating a gateway adapter. */
 export interface GatewayAdapterOptions {
